@@ -1,0 +1,202 @@
+﻿// NOT NONE OF THESE SHADERS ARE OPTIMAL THEY ARE SIMPLE!!!
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel CSRenderWipe
+#pragma kernel CSUpdateTerrainNormals
+
+#include "Assets\Compute\NoiseInclude.compute"
+
+int TexSizeX;
+int TexSizeY;
+int TerrainTexSizeX;
+int TerrainTexSizeY;
+float DeltaTime;
+
+float4 RepulsorPos[4];
+
+RWTexture2D<float4> Result;
+RWTexture2D<float4> ResultLastFrame;
+
+RWTexture2D<float4> Terrain;
+RWTexture2D<float4> TerrainNormals;
+
+struct Particle
+{
+  float2 pos;
+  float2 vel;
+  float2 acc;
+  float2 noise;
+};
+
+RWStructuredBuffer<Particle> PartBuffer;
+
+void UpdateTerrainNormals() {
+  for( int x=0; x<TerrainTexSizeX; x++ ) {
+    for( int y=0; y<TerrainTexSizeY; y++ ) {
+
+      //float2 dt_sum = float2(0,0);
+      //for( int i=-1; i<2; i++ ) {
+        //for( int j=-1; j<2; j++ ) {
+          //if( i<1 )
+            //dt_sum.x += (Terrain[float2(x+i+1, y+j)].b-Terrain[float2(x+i, y+j)].b);
+          //if( j<1 )
+            //dt_sum.y += (Terrain[float2(x+i, y+j+1)].b-Terrain[float2(x+i, y+j)].b);
+        //}
+      //}
+
+      TerrainNormals[float2(x,y)] = Terrain[float2(x,y)];// float4( dt_sum/9, 0, 0 );
+    }
+  }
+}
+
+// Draw Grid
+[numthreads(8, 8, 1)]
+void CSRenderWipe(uint3 id : SV_DispatchThreadID) {
+  Result[id.xy] = float4( 0.0, 0.0, 0.0, 1.0 );
+
+  for( int i=-1; i<2; i++ )
+    for( int j=-1; j<2; j++ )
+      Result[id.xy] += float4( ResultLastFrame[float2(id.x+i,id.y+j)].rgb/16.0, 1.0 );
+  
+  float4 terrain_color = Terrain[float2(id.x*TerrainTexSizeX/TexSizeX, id.y*TerrainTexSizeY/TexSizeY)];//*0.5+0.2;
+  //Result[id.xy] = terrain_color;
+  Result[id.xy] = float4(1.0-terrain_color.bbb,1.0);
+}
+
+// Draw Grid
+[numthreads(8, 8, 1)]
+void CSUpdateTerrainNormals(uint3 id : SV_DispatchThreadID) {
+  float2 dt_sum = float2(0,0);
+
+  for( int i=-2; i<3; i++ ) {
+    for( int j=-2; j<3; j++ ) {
+      if( i<2 )
+        dt_sum.x -= (Terrain[float2(id.x+i+1, id.y+j)].b-Terrain[float2(id.x+i, id.y+j)].b);
+      if( j<2 )
+        dt_sum.y -= (Terrain[float2(id.x+i, id.y+j+1)].b-Terrain[float2(id.x+i, id.y+j)].b);
+    }
+  }
+
+  TerrainNormals[id.xy] = float4( dt_sum, 0, 0 );
+}
+
+float map_clamp( float t, float a1, float a2, float b1, float b2 ) {
+  float tnorm = clamp( (t-a1)/(a2-a1), 0.0, 1.0 );
+  if( tnorm == 1.0 ) return 0.0;
+  return b1 + tnorm*(b2-b1);
+}
+
+float map( float t, float a1, float a2, float b1, float b2 ) {
+  float tnorm = clamp( (t-a1)/(a2-a1), 0.0, 1.0 );
+  return b1 + tnorm*(b2-b1);
+}
+
+// Main Thread
+[numthreads(10, 1, 1)]
+void CSMain(uint3 id : SV_DispatchThreadID) {
+  Particle p = PartBuffer[id.x];
+
+  p.acc = float2( 0.0, 500.0 );
+
+  const float noise_power = 10;
+  float2 atrract_noise = p.noise * noise_power;
+
+  const float att_pow = 800.0;
+  const float att_rad = 1500.0;
+
+  DeltaTime = 0.0066667;
+
+  const int num_repulsors = 4;
+  for( int r=0; r<num_repulsors; r++ ) {
+    for( int s=-1; s<2; s++ ) {
+      float2 vecToAttract = p.pos - RepulsorPos[r].xy + float2(s * TexSizeX,0);
+      float2 spin_vec = cross( normalize(float3(vecToAttract,0.0)), float3(0,0,1) ).xy;
+
+      float attract_accel = att_pow * RepulsorPos[r].z;
+      float len_to_attract = length(vecToAttract);
+      float attract_dist_mapped = map( len_to_attract, 0, att_rad, 1.0, 0.0 );
+      float2 attract_acc = attract_dist_mapped * attract_dist_mapped * normalize( vecToAttract ) * attract_accel;
+
+      //p.acc.xy += attract_acc + atrract_noise + spin_vec*attract_dist_mapped*300;
+    }
+  }
+
+  float2 terrain_uv = float2(p.pos.x*TerrainTexSizeX/TexSizeX, p.pos.y*TerrainTexSizeY/TexSizeY);
+
+  const int top_bottom_border = 5;
+  if( terrain_uv.y < TerrainTexSizeY-top_bottom_border && terrain_uv.y > top_bottom_border )
+    p.acc.xy += TerrainNormals[terrain_uv]*float2(-1000.0,-1000.0) + atrract_noise;
+
+  const float timescale = 3.0;
+  p.vel += p.acc * DeltaTime * timescale;
+  p.pos += p.vel * DeltaTime * timescale;
+
+  p.vel *= 0.9;
+
+  Terrain[terrain_uv] = clamp( Terrain[terrain_uv] + float4( 0, 0, 0.00001, 0 ), 0, 1 );
+  //Terrain[float2(terrain_uv.x+1,terrain_uv.y)] = clamp( Terrain[float2(terrain_uv.x+1,terrain_uv.y)] - float4( 0, 0, -0.00001, 0 ), -1, 1 );
+  //Terrain[float2(terrain_uv.x-1,terrain_uv.y)] = clamp( Terrain[float2(terrain_uv.x-1,terrain_uv.y)] - float4( 0, 0, -0.00001, 0 ), -1, 1 );
+
+  const float min_vel_thresh = 50;
+  const float min_accel_thresh = 50;
+  if( length( p.vel ) < min_vel_thresh && length(p.acc) < min_accel_thresh ) {
+    p.pos.y = 0;
+  }
+
+  // Hit Border
+  if (p.pos.x < 0) {
+    p.pos.x = TexSizeX;
+  }
+  else if (p.pos.x > TexSizeX) {
+    p.pos.x = 0;
+  }
+
+  if (p.pos.y < 0) {
+    p.pos.y = TexSizeY;
+  }
+  else if (p.pos.y > TexSizeY) {
+    p.pos.y = p.pos.y - TexSizeY;
+    //p.pos.x = fmod(p.pos.x,0.01*TexSizeX) + 0.45*TexSizeX;
+    p.vel = float2(0,0);
+    p.acc = float2(0,0);
+  }
+
+  float3 color0 = float3( 0, 0, .2 );
+  float3 color1 = float3( 0, .2, .7 );
+  float3 color2 = float3( 0, 0, 1 );
+  float3 color3 = float3( 1, 1.0, 1 );
+
+  const float vel0 = 0;
+  const float vel1 = 20;
+  const float vel2 = 50;
+  const float vel3 = 180;
+
+  float ramp01 = map_clamp( length(p.vel), vel0, vel1, 0.0, 1.0 );
+  float ramp10 = map_clamp( length(p.vel), vel1, vel0, 0.0, 1.0 );
+
+  float ramp12 = map_clamp( length(p.vel), vel1, vel2, 0.0, 1.0 );
+  float ramp21 = map_clamp( length(p.vel), vel2, vel1, 0.0, 1.0 );
+
+  float ramp23 = map( length(p.vel), vel2, vel3, 0.0, 1.0 );
+  float ramp32 = map_clamp( length(p.vel), vel3, vel2, 0.0, 1.0 );
+
+  float3 color = 
+    ramp10*color0 + 
+    ramp01*color1 + 
+
+    ramp21*color1 + 
+    ramp12*color2 + 
+
+    ramp23*color3 + 
+    ramp32*color2;
+
+
+  // Render & Save
+  for( int i=0; i<3; i++ )
+    for( int j=0; j<3; j++ )
+      Result[float2(p.pos.x+i, p.pos.y+j)] = float4(color*0.6, 1.0);
+
+  Result[p.pos] = float4(color, 1.0);
+
+  PartBuffer[id.x] = p;
+}
